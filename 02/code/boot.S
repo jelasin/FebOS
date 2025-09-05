@@ -64,7 +64,6 @@ load_setup:
 
 	movw $0x0080, %dx    # DH=0(磁头0), DL=0x80(驱动器0x80，即第一块硬盘)
 	movw $0x0002, %cx    # CH=0(磁道0), CL=2(从第2扇区开始，第1扇区是引导扇区)
-	# movw $SETUPSEG, %bx  # 这行是错误的，已由上面的代码修正
 	movb $SETUPLEN, %al  # AL=4，要读取的扇区数
 	movb $0x02, %ah      # AH=2，BIOS磁盘服务功能号：读扇区
 	int $0x13            # 调用BIOS磁盘服务中断
