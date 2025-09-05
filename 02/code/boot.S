@@ -22,7 +22,8 @@ start2:
 	movw %ax, %es        # 设置附加段寄存器ES = 0x7c0
 	movw %ax, %fs        # 设置FS段寄存器 = 0x7c0
 	movw %ax, %gs        # 设置GS段寄存器 = 0x7c0
-	movw $0x7c00, %sp    # 设置栈指针SP = 0x7c00（栈向下增长，高地址向低地址增长）
+	movw %ax, %ss        # 设置栈段寄存器SS = 0x7c0
+	movw $0x0000, %sp    # 设置栈指针SP = 0x0000（栈顶在0x7c0:0 = 0x7c00）
 
 	# === 设置图形显示模式 ===
 	movw $0x0013, %ax    # AH=0x00(设置显示模式), AL=0x13(320x200 256色)
