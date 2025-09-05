@@ -1,4 +1,4 @@
-# 01 - 16 位实模式最小 C 引导程序详解
+# boot 实现
 
 本目录展示如何用 **C + 内联汇编 + 自定义链接脚本** 构建一个 512 字节 BIOS 启动扇区：进入 VGA 0x13 模式并输出一行文本后停机。
 
@@ -17,6 +17,111 @@
 | `boot.mk` | 构建流程 (编译→链接→裁剪→运行) |
 
 ## 相关知识点补充
+
+### gcc 内联汇编
+
+本项目里大量依赖 **GCC 扩展内联汇编 (Extended Inline Assembly)** 来直接访问 BIOS / 设置段寄存器。理解其语法与约束，能避免很多“莫名其妙的编译或运行错误”。下面总结最常用、且与 16 位引导程序直接相关的知识点。
+
+#### 基本格式
+
+```c
+__asm__ volatile (
+    "指令串\n"
+    : 输出约束列表          /* 可为空 */
+    : 输入约束列表          /* 可为空 */
+    : “破坏(被修改)寄存器/内存” 列表
+);
+```
+
+四段用冒号分隔；缺省可留空但冒号要保留。`volatile` 告诉编译器：不要因为看似“无副作用”而优化掉或重排这段指令。
+
+#### AT&T 语法速记
+
+| 要素 | 规则 | 示例 |
+|------|------|------|
+| 指令操作数顺序 | 源, 目的 | `movw %ax, %ds` |
+| 立即数 | 以 `$` 前缀 | `$0x13` |
+| 寄存器 | 以 `%` 前缀 | `%ax` |
+| 宽度后缀 | b=8, w=16, l=32 (本项目用 b/w) | `movw`, `int $0x10` |
+| 内存操作 | `disp(base,index,scale)` | `(%si)`, `msg(%bp)` |
+
+#### 约束 (constraints) 基础
+
+| 约束 | 含义 | 适用示例 |
+|-------|------|----------|
+| `r` | 任意通用寄存器 (gcc 选) | `: "r"(val)` |
+| `i` | 立即数常量 | `: "i"(0x13)` |
+| `a`/`b`/`c`/`d`/`S`/`D` | 指定 AX/BX/CX/DX/SI/DI | `: "a"(0x1301)` |
+| `m` | 内存操作数 | 很少在 16 位简短序列中用 |
+| `"=&r"` | 早期被修改的输出 (early clobber) | 多指令写同一输出 |
+| `"+r"` | 既作输入又作输出 (读-改-写) | 计数器/累加器 |
+
+常见写法：
+
+```c
+int ch = 'A';
+__asm__ volatile ("int $0x10" : : "a"(0x0e00 | ch), "b"(0x0000));
+```
+
+说明：把 `AX=0x0E??` (Teletype 输出)，`BX` 页=0 颜色=0，然后触发 BIOS 视频中断。
+
+#### Clobber 列表与 `memory`
+
+若汇编修改了未出现在输出约束中的寄存器，必须放入 **clobber 列表**，否则 GCC 可能错误复用寄存器导致逻辑错：
+
+```c
+__asm__ volatile ("movw %0, %%ds" : : "r"(seg) : "memory", "ds");
+```
+
+`"memory"` 表示此汇编可能读/写任意内存，禁止编译器把前后的内存访问重排；对端口 I/O、访问显存、BIOS 调用后期望结果已落内存时常加。
+
+#### 向段寄存器写值
+
+段寄存器只能来源通用寄存器：
+
+```c
+static inline void set_ds(unsigned short seg) {
+    __asm__ volatile ("movw %0, %%ds" : : "r"(seg) : "memory", "ds");
+}
+```
+
+若要一次设置多个：拆成多条或放同一 `asm` 块里，减少寄存器分配波动。
+
+#### 多行写法与自动换行
+
+用 `\n` 分隔指令，最后一行可省略 `\n`；建议加 `\n\t` 让反汇编更整洁：
+
+```c
+__asm__ volatile (
+    "xor %%ax, %%ax\n\t"
+    "mov %%ax, %%ds\n\t"
+    "mov %%ax, %%es"
+);
+```
+
+#### 远跳 (far jump) 与代码段同步
+
+修改 `CS` 只能通过 *远控制转移*：
+
+```c
+__asm__ volatile ("ljmp $0x7C0, $next_label\nnext_label:");
+```
+
+通常我们让链接脚本把加载地址直接等于执行地址 (恒 =0x7C00)，可避免切换 `CS` 的麻烦。只有在“搬移自身”或“进入保护模式”前需要精确远跳。
+
+#### 使用输出约束收集结果
+
+从 BIOS 取值：
+
+```c
+unsigned short cursor_pos;
+__asm__ volatile (
+    "int $0x10"
+    : "=d"(cursor_pos)              /* 取 DX (行列信息) */
+    : "a"(0x0300), "b"(0x0000)
+    : "cx"
+);
+```
 
 ### 8086 寄存器与 16 位实模式
 
@@ -116,6 +221,71 @@ Physical = Segment * 16 + Offset  (即 Segment << 4 + Offset)
 | `iret` | 中断返回 | 弹标志+CS:IP |
 | `loop` | CX--!=0 跳 | `loop again` |
 | 条件跳转 | 按标志 | `jz/jnz/jc/ja/...` |
+
+条件跳转详解 (cmp / test 之后如何选指令)
+
+`cmp L,R` 逻辑：计算 (L - R) 只更新标志，不写回。核心标志：
+ZF=结果为0；CF=无符号借位(L<R)；SF=符号位；OF=有符号溢出；PF=低8位偶校验。
+
+无符号关系 (after `cmp L,R`)：
+
+- `<`  : `jb` / `jc`   (CF=1)
+- `<=` : `jbe`         (CF=1 or ZF=1)
+- `>`  : `ja`          (CF=0 and ZF=0)
+- `>=` : `jae` / `jnb` (CF=0)
+
+有符号关系：利用 (SF xor OF) 判“<”
+
+- `<`  : `jl`          (SF!=OF)
+- `<=` : `jle`         (ZF=1 or SF!=OF)
+- `>`  : `jg`          (ZF=0 and SF=OF)
+- `>=` : `jge`         (SF=OF)
+
+相等/不等：`je/jz` (ZF=1), `jne/jnz` (ZF=0)
+
+标志直接：`jc/jnc` (CF=1/0), `jo/jno` (OF=1/0), `js/jns` (SF=1/0), `jp/jnp` (PF=1/0)。
+
+常混淆：
+
+- `ja` / `jb` 只看无符号；`jg` / `jl` 只用于有符号。
+- `jb == jc`（借位=进位）；`jae == jnb`；`jbe == jna`；`ja == jnbe`。
+- “带等号”多一个 ZF 条件（或组合 OR ZF / AND ZF=0）。
+
+快速记忆口诀：
+
+```text
+无符号：CF=1 ⇒ below，CF=0 且 ZF=0 ⇒ above
+有符号：SF xor OF ⇒ less；(SF==OF 且 ZF=0) ⇒ greater
+== ⇒ ZF=1；!= ⇒ ZF=0
+```
+
+循环类特例：`loop` (CX--, CX!=0 跳)；`loope/loopz` (CX--, CX!=0 且 ZF=1)；`loopne/loopnz` (CX--, CX!=0 且 ZF=0)；`jcxz` (CX=0)；(32/64 位对应 `jecxz`/`jrcxz`)。
+
+若需要把条件变成布尔值写寄存器，可用 `setcc` 家族（`sete/setne/setb/setg/...`）。
+
+实践建议：
+
+1. 先决定比较视角（有符号/无符号）再选跳转助记符。
+2. 复杂分支将“最常走路径”作为 fall-through（不要跳）提升预测命中。
+3. 先 `cmp` 再紧跟条件跳转，避免中间插入会改标志的指令。
+
+示例：检查一个 16 位有符号值 x 是否在 [-10,10]：
+
+```asm
+    mov x, %ax
+    cmp $-10, %ax
+    jl out_of_range
+    cmp $10, %ax
+    jg out_of_range
+    ; in range
+```
+
+示例：无符号范围 0 <= x < n：
+
+```asm
+    cmp n, %ax      # (ax - n)
+    jae out_of_range  # ax >= n ⇒ 不合法
+```
 
 ##### 标志/方向/现场
 
