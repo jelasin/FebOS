@@ -34,11 +34,11 @@ $(LOADER_TARGET): $(LOADER_OBJECTS)
 # 组合镜像规则 - 将引导扇区和加载器合并
 $(COMBINED_TARGET): $(BOOT_TARGET) $(LOADER_TARGET)
 	@echo "创建组合镜像文件..."
-	# 创建引导扇区 (512字节)
+# 创建引导扇区 (512字节)
 	dd if=$(BOOT_TARGET) of=$@ bs=512 count=1 conv=notrunc 2>/dev/null
-	# 添加加载器到第2-5扇区 (4个扇区，2048字节)
+# 添加加载器到第2-5扇区 (4个扇区，2048字节)
 	dd if=$(LOADER_TARGET) of=$@ bs=512 seek=1 count=4 conv=notrunc 2>/dev/null
-	# 确保文件大小为 2560 字节 (5个扇区)
+# 确保文件大小为 2560 字节 (5个扇区)
 	dd if=/dev/zero of=$@ bs=512 seek=5 count=0 2>/dev/null
 	@echo "组合镜像创建完成: $@ (大小: $$(stat -c%s $@) 字节)"
 

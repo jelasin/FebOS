@@ -91,6 +91,36 @@ _start_setup:
 	movw %bx, (10)        # 保存显示内存大小
 	movw %cx, (12)        # 保存特征位信息
 
+	# 恢复代码段给字符串访问
+	movw %cs, %ax
+	movw %ax, %ds
+	# 打印字符字体信息
+	movw $font_msg, %si
+	call print_string
+	# 切换回数据段获取数值
+	movw $INITSEG, %ax
+	movw %ax, %ds
+	movw (8), %dx        # EGA/VGA状态信息
+
+	# 恢复代码段给print_hex
+	movw %cs, %ax
+	movw %ax, %ds
+	call print_hex
+
+	movw $INITSEG, %ax
+	movw %ax, %ds
+	movw (10), %dx       # 显示内存大小
+	movw %cs, %ax
+	movw %ax, %ds
+	call print_hex
+
+	movw $INITSEG, %ax
+	movw %ax, %ds
+	movw (12), %dx       # 特征位信息
+	movw %cs, %ax
+	movw %ax, %ds
+	call print_hex
+
 	# === 获取第一块硬盘(hd0)参数 ===
 	movw $0x0000, %ax     # 设置段寄存器为0
 	movw %ax, %ds
@@ -102,6 +132,36 @@ _start_setup:
 	movw $0x10, %cx       # 复制16字节
 	rep                   # 重复执行下一条指令
 	movsb                 # 从DS:SI复制字节到ES:DI，并递增SI和DI
+
+	# 打印hd0参数
+	movw %cs, %ax          # 切回代码段打印字符串
+	movw %ax, %ds
+	movw $hd0_msg, %si
+	call print_string
+
+	movw $INITSEG, %ax     # 切换到参数所在段
+	movw %ax, %ds
+	movw $0x0080, %si      # SI指向hd0参数 
+	movw $16, %cx          # 共16字节
+
+.print_hd0_loop:
+	lodsb                  # AL = [DS:SI]
+	pushw %cx
+	call print_hex8        # 打印1字节(2位hex)
+	# 打印空格
+	movb $' ', %al
+	movb $0x0e, %ah
+	movb $0x00, %bh
+	movb $0x07, %bl
+	int $0x10
+	popw %cx
+	loop .print_hd0_loop
+
+	# 换行
+	movw %cs, %ax
+	movw %ax, %ds
+	movw $newline, %si
+	call print_string
 
 	# === 获取第二块硬盘(hd1)参数 ===
 	movw $0x0000, %ax     # 重置段寄存器
@@ -120,7 +180,8 @@ _start_setup:
 	int $0x13             # 调用BIOS磁盘服务中断
 	jc no_disk1           # 如果进位标志置位(出错)，跳转到no_disk1
 	cmpb $3, %ah          # 检查返回值：AH=3表示硬盘存在
-	je is_disk1           # 如果相等，硬盘存在，跳转到is_disk1
+	je has_disk1          # 如果相等，硬盘存在
+	jmp no_disk1          # 其他返回值按不存在处理
 
 no_disk1:
 	# === 第二块硬盘不存在，清空其参数区域 ===
@@ -132,10 +193,44 @@ no_disk1:
 	rep
 	stosb                 # 将AL的值存储到ES:DI，并递增DI
 
-is_disk1:
+	# 打印hd1不存在信息
+	movw %cs, %ax
+	movw %ax, %ds
+	movw $hd1_absent_msg, %si
+	call print_string
+	jmp after_hd1          # 跳过参数打印
+
+has_disk1:
 	# === 恢复数据段寄存器 ===
 	movw %cs, %ax         # 恢复DS为代码段
 	movw %ax, %ds
+
+	# 如果hd1存在（或已清空），打印其参数（清空后即全0）
+	movw $hd1_msg, %si
+	call print_string
+
+	movw $INITSEG, %ax
+	movw %ax, %ds
+	movw $0x0090, %si      # SI指向hd1参数
+	movw $16, %cx
+.print_hd1_loop:
+	lodsb
+	pushw %cx
+	call print_hex8
+	movb $' ', %al         # 空格
+	movb $0x0e, %ah
+	movb $0x00, %bh
+	movb $0x07, %bl
+	int $0x10
+	popw %cx
+	loop .print_hd1_loop
+
+	movw %cs, %ax
+	movw %ax, %ds
+	movw $newline, %si
+	call print_string
+
+after_hd1:
 
     # === 显示完成信息 ===
 	movw $setup_success_msg, %si  # SI指向成功消息
@@ -209,6 +304,42 @@ print_hex:
 	popw %dx              # 恢复原始DX值
 	ret                   # 返回调用者
 
+# =========================================================================
+# === 子程序: 打印8位十六进制数 (AL) ===
+# 输入: AL=要打印的字节
+# 破坏: AX,BX
+# =========================================================================
+print_hex8:
+	pushw %ax
+	pushw %bx
+	movb %al, %bl          # 保存原字节
+	movb %bl, %al          # 高4位
+	shr $4, %al
+	call print_hex_nibble
+	movb %bl, %al          # 低4位
+	andb $0x0f, %al
+	call print_hex_nibble
+	popw %bx
+	popw %ax
+	ret
+
+# =========================================================================
+# === 子程序: 打印4位十六进制数 (AL低4位) ===
+# 输入: AL=0..15
+# 破坏: AX
+# =========================================================================
+print_hex_nibble:
+	cmpb $10, %al
+	jb .nibble_digit
+	addb $7, %al
+.nibble_digit:
+	addb $0x30, %al
+	movb $0x0e, %ah
+	movb $0x00, %bh
+	movb $0x05, %bl
+	int $0x10
+	ret
+
 # ============================================================================
 # === 数据区域 ===
 # ============================================================================
@@ -230,6 +361,22 @@ video_msg:
 
 hex_prefix:
 	.ascii "0x"                           # 十六进制前缀
+	.byte 0
+
+font_msg:
+	.ascii "Font info: \r\n"                  # 字符字体信息
+	.byte 0
+
+hd0_msg:
+	.ascii "HD0 params: \r\n"
+	.byte 0
+
+hd1_msg:
+	.ascii "HD1 params: \r\n"
+	.byte 0
+
+hd1_absent_msg:
+	.ascii "HD1 not present, params zeroed.\r\n"
 	.byte 0
 
 newline:
