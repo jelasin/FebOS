@@ -231,14 +231,81 @@ has_disk1:
 	call print_string
 
 after_hd1:
+	# 切换到文本模式 80x25 (mode 3) 并清屏 (在仍可用 BIOS 中断前进行)
+	movw $0x0003, %ax
+	int $0x10
+	movb $0x06, %ah
+	movb $0x00, %al
+	movb $0x07, %bh
+	xor %cx, %cx
+	movw $0x184f, %dx
+	int $0x10
+	# 重置 vga_print 光标
+	movw %cs, %ax
+	movw %ax, %ds
+	movw $0, cursor_pos
 
-    # === 显示完成信息 ===
-	movw $setup_success_msg, %si  # SI指向成功消息
-	call print_string             # 调用打印子程序
+	# === 加载 GDT ===
+	# 计算 gdt_start 的物理地址: (CS << 4) + offset(gdt_start)
+	# 写入到 gdt_descriptor (6 字节: limit(2) + base(4)) 并执行 lgdt
+	movw %cs, %ax           # AX = 当前代码段
+	pushw %ax
+	pushw %bx
+	pushw %dx
+	movw %ax, %dx           # DX = CS (用于高位计算)
+	shl $4, %ax             # AX = CS << 4  (段基址低 16 位候选)
+	movw $gdt_start, %bx    # BX = gdt_start 偏移
+	addw %bx, %ax           # AX = 低 16 位物理地址
+	movw %ax, gdt_descriptor+2  # 填写 base 低 16 位
+	# 计算高 16 位: (CS<<4) 的高 4 位 + 低 16 位加法产生的进位
+	movw %dx, %bx           # BX = CS
+	shr $12, %bx            # BX = (CS >> 12) = (CS<<4) 的高 4 位
+	adcw $0, %bx            # 进位加入
+	movw %bx, gdt_descriptor+4  # base 高 16 位
+	popw %dx
+	popw %bx
+	popw %ax
+	movw %cs, %ax           # 重新确保 DS=CS
+	movw %ax, %ds
+	lgdt gdt_descriptor     # 加载 GDT
+	movw $gdt_load_msg, %si
+	call vga_print
+
+	# === 系统搬移 ===
+	movw %cs, %ax
+	movw %ax, %ds
+	movw $reloc_start_msg, %si
+	call vga_print
+
+	cli
+	cld
+	movw $0x1000, %ax
+	movw %ax, %ds
+	movw $0x0000, %ax
+	movw %ax, %es
+	xor %si, %si
+	xor %di, %di
+	movw $0x8000, %cx
+	rep movsw
+	sti
+
+	movw %cs, %ax
+	movw %ax, %ds
+	movw $reloc_done_msg, %si
+	call vga_print
+
+	# open A20 (占位, 未实现)
+
+	# jmp protect mode (占位, 未实现)
 
 halt:
-	# === 程序结束，进入死循环 ===
-	jmp halt              # 无限循环，停止执行
+	movw %cs, %ax
+	movw %ax, %ds
+	movw $setup_success_msg, %si
+	call vga_print
+	halt_loop:
+	hlt
+	jmp halt_loop
 
 # ============================================================================
 # === 子程序: 打印以null结尾的字符串 ===
@@ -341,6 +408,63 @@ print_hex_nibble:
 	ret
 
 # ============================================================================
+# 直接写显存的简易打印 vga_print
+# 输入: SI 指向以 0 结尾字符串, 使用文本模式 80x25, 写入 0xB800: 当前位置递增
+# 仅支持 '\r' '\n'; 颜色属性固定 0x0F
+# 使用寄存器: AX,BX,CX,DX,SI,DI（不保存）
+# ============================================================================
+vga_print:
+	pushw %ds
+	pushw %es
+	movw $0xB800, %ax
+	movw %ax, %es
+	# 简单：使用静态光标变量 (放在代码段数据里) cursor_pos (字)
+	movw %cs, %ax
+	movw %ax, %ds
+	movw cursor_pos, %di      # DI = 当前位置(以字节为单位)
+	movb $0x0F, %bl           # 颜色属性
+.vp_loop:
+	lodsb                     # AL = 字符
+	cmpb $0, %al
+	je .vp_done
+	cmpb $'\n', %al
+	je .vp_newline
+	cmpb $'\r', %al
+	je .vp_cr
+	movb %al, %es:(%di)
+	incw %di
+	movb %bl, %es:(%di)
+	incw %di
+	jmp .vp_loop
+.vp_cr:
+	# 回车: DI 回到当前行行首 (列0). 行宽=160 字节
+	movw %di, %ax
+	movw $160, %bx
+	xorw %dx, %dx
+	divw %bx                 # AX=行号, DX=列偏移
+	subw %dx, %di            # 退回列偏移 -> 行首
+	jmp .vp_loop
+.vp_newline:
+	# 换行: 跳到下一行行首
+	# 算当前行号+1，再乘160
+	movw %di, %ax
+	movw $160, %bx
+	xorw %dx, %dx
+	divw %bx      # AX=行号
+	incw %ax
+	mul %bx       # AX = (行号+1)*160
+	movw %ax, %di
+	jmp .vp_loop
+.vp_done:
+	movw %di, cursor_pos
+	popw %es
+	popw %ds
+	ret
+
+cursor_pos:
+	.word 0           # 初始光标(字节偏移)
+
+# ============================================================================
 # === 数据区域 ===
 # ============================================================================
 setup_msg:
@@ -384,5 +508,43 @@ newline:
 	.byte 0
 
 setup_success_msg:
-    .ascii "\r\n[Loader] Setup completed...\r\n"  # 设置完成消息
-    .byte 0                                         # 字符串结束符
+    .ascii "[Loader] Setup completed...\r\n"  # 设置完成消息
+    .byte 0                                       # 字符串结束符
+
+reloc_start_msg:
+	.ascii "[Loader] Relocating system 0x10000 -> 0x00000 (512KB)\r\n"
+	.byte 0
+
+reloc_done_msg:
+	.ascii "[Loader] Relocation done.\r\n"
+	.byte 0
+
+gdt_load_msg:
+	.ascii "[Loader] GDT loaded (flat code=0x08, data=0x10, vga=0x18).\r\n"
+	.byte 0
+
+# ===== GDT 定义 (单一版本, 包含 VGA 段) =====
+.align 8
+gdt_start:
+	# 0x00 空描述符
+	.word 0,0
+	.word 0,0
+	# 0x08 代码段: base=0 limit=4GB 粒度4K D=1 32位 可执行可读
+	.word 0xFFFF, 0x0000
+	.word 0x9A00, 0x00CF
+	# 0x10 数据段: base=0 limit=4GB 粒度4K D=1 可读写
+	.word 0xFFFF, 0x0000
+	.word 0x9200, 0x00CF
+	# 0x18 VGA 段: base=0xB8000 limit=0x0FFFF 粒度字节 (G=0) D=1
+	.word 0xFFFF, 0x8000        # limit 0:15, base 0:15
+	.word 0x920B, 0x0040        # base 16:23 + access, flags + limit 16:19 + base 24:31
+gdt_end:
+
+gdt_descriptor:                 # 6 字节伪描述符, base 运行时回填
+	.word gdt_end - gdt_start - 1
+	.word 0
+	.word 0
+
+CODE_SEL = 0x08
+DATA_SEL = 0x10
+VGA_SEL  = 0x18

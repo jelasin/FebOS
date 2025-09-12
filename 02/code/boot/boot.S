@@ -1,11 +1,12 @@
 # === 常量定义部分 ===
-SETUPLEN = 4         # setup模块占用的扇区数量（4个扇区）
-BOOTSEG  = 0x7c0     # 引导扇区被BIOS加载到的段地址（0x7c00物理地址）
-INITSEG  = 0x9000    # 引导扇区将要移动到的目标段地址（0x90000物理地址）
-SETUPSEG = 0x9020    # setup模块将要加载到的段地址（0x90200物理地址）
-SYSSEG   = 0x1000    # 系统内核将要加载到的段地址（0x10000物理地址）
-ENDSEG   = SYSSEG + SYSSIZE  # 系统结束段地址（SYSSIZE需要链接时定义）
-ROOT_DEV = 0x000     # 根设备号，0表示由setup程序自动检测
+SETUPLEN = 4           # setup模块占用的扇区数量（4个扇区）
+BOOTSEG  = 0x7c0       # 引导扇区被BIOS加载到的段地址（0x7c00物理地址）
+INITSEG  = 0x9000      # 引导扇区将要移动到的目标段地址（0x90000物理地址）
+SETUPSEG = 0x9020      # setup模块将要加载到的段地址（0x90200物理地址）
+SYSSEG   = 0x1000      # system将被加载到的段地址（0x10000物理地址）
+SYSSIZE  = 0x3000      # 以16字节(段落/paragraph=16B)为单位的最大加载大小: 0x3000*16=192KB
+ENDSEG   = SYSSEG + SYSSIZE  # 系统结束段地址（上界）
+ROOT_DEV = 0x000       # 根设备号，0表示由setup程序自动检测
 
 .code16              # 告诉汇编器生成16位实模式代码
 .text                # 代码段开始
@@ -26,7 +27,7 @@ start2:
 	movw $0x0000, %sp    # 设置栈指针SP = 0x0000（栈顶在0x7c0:0 = 0x7c00）
 
 	# === 设置图形显示模式 ===
-	movw $0x0013, %ax    # AH=0x00(设置显示模式), AL=0x13(320x200 256色)
+	movw $0x0013, %ax    # AH=0x00(设置显示模式), AL=0x13(320x200 256色) AL=0x03(80x25文本模式)
 	int $0x10            # 调用BIOS视频服务中断
 
 	# === 显示启动信息 ===
@@ -80,13 +81,87 @@ ok_load_setup:
 	movw $msg_2, %si     # 将msg_2字符串地址加载到SI
 	call print_string    # 调用字符串打印子程序
 
-	# === 第五阶段：转交控制权给setup模块 ===
-	jmpl $SETUPSEG, $0   # 远跳转到0x9020:0，开始执行setup代码
+	# === 第五阶段：读取 system (head) 到 0x10000 ===
+	# 此处仿照 Linux 0.11 的 read_it/read_track 逻辑进行精简版本实现
+	movw $SYSSEG, %ax      # 目标段 = 0x1000
+	movw %ax, %es
+	xorw %bx, %bx          # 偏移 0
+	call read_system       # 读取 system (从磁盘的后续扇区开始)
+	call kill_motor        # 关闭软盘/磁盘马达（兼容逻辑）
+
+	# === 第六阶段：转交控制权给 setup 模块 ===
+	jmpl $SETUPSEG, $0     # 远跳转到0x9020:0，开始执行setup代码
 
 halt:
 	# === 异常处理：系统挂起 ===
 	hlt                  # CPU进入停机状态，等待中断
 	jmp halt             # 死循环，防止意外继续执行
+
+# ===========================================================
+# 读取 system (head) 模块到 0x10000 (ES 初始 = SYSSEG)
+# 简化策略：假设 system 紧随 loader 之后，从 LBA = 1+SETUPLEN 开始连续存放。
+# 不做跨 64KB 边界复杂处理，只顺序填充，直到达到 SYSSIZE 或读失败。
+# ===========================================================
+read_system:
+	pushw %ax
+	pushw %bx
+	pushw %cx
+	pushw %dx
+
+	# 起始 LBA (CHS 简化: 只适用于单柱面情况下的 demo；真实实现需 CHS 转换)
+	movw $0, %dx        # DH=head=0, DL=0x80 硬盘(后面补)
+	movb $0x80, %dl     # 设备: 第一块硬盘
+	movw $0, %cx        # CH=0, CL稍后设置
+	movw $(1+SETUPLEN), %si  # 当前逻辑扇区号 (从第5扇区开始)
+	movw $(1+SETUPLEN), %di  # 记录起始，备用
+	movw $0, %bp             # 已读的扇区计数
+
+.rs_loop:
+	cmpw $SYSSIZE, %bp    # 已读扇区是否超过（用“段”粗略限制）
+	jae .rs_done
+
+	# 将逻辑扇区号转为 CHS (极度简化: 只支持同一柱面前若干扇区)
+	movw %si, %ax
+	addw $1, %ax          # BIOS 扇区号从1开始
+	movb %al, %cl         # CL=扇区号 (低6位)
+	movb $0, %ch          # CH=0 (track 0)
+
+	movw $0x0201, %ax     # AH=2 读磁盘; AL=1 扇区
+	int $0x13
+	jc .rs_done           # 出错则结束
+
+	# 前进到下一个缓冲区位置
+	addw $512, %bx
+	jc .next_segment
+	jmp .cont
+
+.next_segment:
+	# 进入下一个段 (避免偏移溢出); 不能直接对段寄存器做 add
+	movw %es, %ax
+	addw $0x1000, %ax    # 前进 64KB (0x10000 bytes / 16 = 0x1000 段)
+	movw %ax, %es
+	xorw %bx, %bx
+
+.cont:
+	incw %si
+	incw %bp
+	jmp .rs_loop
+
+.rs_done:
+	popw %dx
+	popw %cx
+	popw %bx
+	popw %ax
+	ret
+
+# 关闭磁盘马达
+kill_motor:
+	pushw %dx
+	movw $0x3f2, %dx
+	movb $0x00, %al
+	outb %al, (%dx)
+	popw %dx
+	ret
 
 # === 子程序定义 ===
 # 功能：在屏幕上打印以null结尾的字符串
